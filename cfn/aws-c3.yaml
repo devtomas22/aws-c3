@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  aws-c3 - Common Crawl "fresh URL" pipeline. Streams the entire Common Crawl
+  CDX index history, keeps a compact hash-only master (url hash -> first/last crawl),
+  and emits the fresh (previously unseen) URL set for each crawl listed.
+  Plug-and-play for a fresh AWS account: no keypair needed (SSM shell access),
+  no pre-existing buckets (stack creates them), budget alarm included.
+
+Parameters:
+  CrawlIds:
+    Type: CommaSeparatedList
+    Default: "CC-MAIN-2026-43"
+    Description: >-
+      Common Crawl IDs to process oldest first, quoted. Examples:
+      CC-MAIN-2026-43. Full history has 129 crawls (2008 through now).
+  LatestCrawl:
+    Type: String
+    Default: "CC-MAIN-2026-43"
+    Description: The crawl whose previously-unseen URLs become the fresh set.
+  InstanceType:
+    Type: String
+    Default: c6i.4xlarge
+    AllowedValues: [c6i.4xlarge, c6i.8xlarge, c6i.2xlarge, t3.2xlarge]
+    Description: >-
+      c6i.4xlarge handles one crawl (about 230 GiB of CDX) in 2.5 to 3 hours.
+      Full history (129 crawls, about 30 TiB) on c6i.8xlarge takes 6 to 10 hours.
+  VolumeSizeGiB:
+    Type: Number
+    Default: 200
+    MinValue: 32
+    MaxValue: 16000
+    Description: Scratch volume for spill-sorting (200 GiB covers any single crawl).
+  Spot:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Use spot pricing (cheaper, may be interrupted - job is resumable per part).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 50
+    MinValue: 5
+    Description: Budget alarm threshold in USD per month.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Email for budget alerts (leave empty to skip the budget resource).
+  InstanceAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 (SSM public parameter; no AMI map needed).
+
+Conditions:
+  UseSpot: !Equals [!Ref Spot, "true"]
+  HaveAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "aws-c3-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: streams-to-glacier
+            Status: Enabled
+            Prefix: streams/
+            Transitions:
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 30
+          - Id: fresh-views-to-glacier
+            Status: Enabled
+            Prefix: fresh/
+            Transitions:
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 90
+          - Id: cleanup-incompletes
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      VersioningConfiguration:
+        Status: Enabled
+
+  JobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: aws-c3-data
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+
+  JobProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref JobRole
+
+  JobSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: aws-c3 job - outbound only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress: []
+
+  OnDemandLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "aws-c3-${AWS::StackName}-od"
+      LaunchTemplateData:
+        ImageId: !Ref InstanceAmi
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref JobProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSizeGiB
+              VolumeType: gp3
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf update -y
+              dnf install -y git python3 pigz
+              mkdir -p /work
+              cd /work
+              git clone https://github.com/${RepoOwner}/aws-c3.git repo
+              cd repo
+              export AWS_C3_BUCKET=${DataBucket}
+              export AWS_C3_CRAWLS=${CrawlIds}
+              export AWS_C3_LATEST=${LatestCrawl}
+              export AWS_DEFAULT_REGION=${AWS::Region}
+              nohup python3 scripts/run_job.py >> /var/log/aws-c3.log 2>&1 &
+              echo done
+            - { RepoOwner: "devtomas22" }
+
+  SpotLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: UseSpot
+    Properties:
+      LaunchTemplateName: !Sub "aws-c3-${AWS::StackName}-spot"
+      LaunchTemplateData:
+        ImageId: !Ref InstanceAmi
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref JobProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSizeGiB
+              VolumeType: gp3
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: persistent
+            InstanceInterruptionBehavior: terminate
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf update -y
+              dnf install -y git python3 pigz
+              mkdir -p /work
+              cd /work
+              git clone https://github.com/${RepoOwner}/aws-c3.git repo
+              cd repo
+              export AWS_C3_BUCKET=${DataBucket}
+              export AWS_C3_CRAWLS=${CrawlIds}
+              export AWS_C3_LATEST=${LatestCrawl}
+              export AWS_DEFAULT_REGION=${AWS::Region}
+              nohup python3 scripts/run_job.py >> /var/log/aws-c3.log 2>&1 &
+              echo done
+            - { RepoOwner: "devtomas22" }
+
+  JobInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !If
+          - UseSpot
+          - !Ref SpotLaunchTemplate
+          - !Ref OnDemandLaunchTemplate
+        Version: !If
+          - UseSpot
+          - !GetAtt SpotLaunchTemplate.LatestVersionNumber
+          - !GetAtt OnDemandLaunchTemplate.LatestVersionNumber
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Condition: HaveAlarmEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "aws-c3-${AWS::StackName}"
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - SubscriptionType: ACTUAL
+          Threshold: 80
+          Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            ThresholdType: ABSOLUTE_VALUE
+            Subscribers:
+              - SubscriptionType: EMAIL
+                Address: !Ref AlarmEmail
+        - SubscriptionType: FORECASTED
+          Threshold: 100
+          Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            ThresholdType: ABSOLUTE_VALUE
+            Subscribers:
+              - SubscriptionType: EMAIL
+                Address: !Ref AlarmEmail
+
+Outputs:
+  Bucket:
+    Value: !Ref DataBucket
+  ConnectCommand:
+    Description: Shell into the job instance (no SSH key needed)
+    Value: !Sub "aws ssm start-session --region ${AWS::Region} --target ${JobInstance}"
+  StatusLog:
+    Value: !Sub "aws ssm send-command --instance-ids ${JobInstance} --document-name AWS-RunShellScript --parameters commands='tail -40 /var/log/aws-c3.log' --output text --region ${AWS::Region}"
+  ResultLocation:
+    Value: !Sub "s3://${DataBucket}/master/ and s3://${DataBucket}/fresh/"
